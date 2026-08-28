@@ -2,23 +2,37 @@ import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+# ruff: noqa: E402
+from app.testing import stub_modules
 
-sys.modules['app.helper.sites'] = MagicMock()
-sys.modules['app.db.systemconfig_oper'] = MagicMock()
-sys.modules['app.db.systemconfig_oper'].SystemConfigOper.return_value.get.return_value = None
+# 仅在 import 期用假模块替换依赖，退出 with 后还原，避免污染后续测试的 sys.modules
+_systemconfig_stub = MagicMock()
+_systemconfig_stub.SystemConfigOper.return_value.get.return_value = None
+with stub_modules({
+    'app.helper.sites': MagicMock(),
+    'app.db.systemconfig_oper': _systemconfig_stub,
+}):
+    from app import schemas
+    from app.chain.media import MediaChain, ScrapingConfig, ScrapingOption
+    from app.core.context import MediaInfo
+    from app.core.event import Event
+    from app.core.metainfo import MetaInfo
+    from app.schemas.types import EventType, MediaType, ScrapingTarget, ScrapingMetadata, ScrapingPolicy
 
-from app import schemas
-from app.chain.media import MediaChain, ScrapingOption
-from app.core.context import MediaInfo
-from app.core.event import Event
-from app.core.metainfo import MetaInfo
-from app.schemas.types import EventType, MediaType, ScrapingTarget, ScrapingMetadata, ScrapingPolicy
+
+def reset_media_chain_singleton():
+    """清理 MediaChain 单例，避免测试间复用被 mock 的实例。"""
+    MediaChain._instances.pop((MediaChain, (), frozenset()), None)
 
 
 class TestMediaScrapingPaths(unittest.TestCase):
     def setUp(self):
+        reset_media_chain_singleton()
         self.media_chain = MediaChain()
         self.media_chain.storagechain = MagicMock()
+
+    def tearDown(self):
+        reset_media_chain_singleton()
 
     def test_movie_file_nfo_path(self):
         fileitem = schemas.FileItem(path="/movies/avatar.mkv", name="avatar.mkv", type="file", storage="local")
@@ -32,6 +46,20 @@ class TestMediaScrapingPaths(unittest.TestCase):
         )
         self.assertEqual(target_item, parent_item)
         self.assertEqual(target_path, Path("/movies/avatar.nfo"))
+
+    def test_scraping_config_does_not_share_policy_state_between_instances(self):
+        """刮削配置实例之间不应共享已删除或覆盖过的策略。"""
+        first_config = ScrapingConfig({"movie_nfo": ScrapingPolicy.SKIP})
+        second_config = ScrapingConfig({})
+
+        self.assertEqual(
+            ScrapingPolicy.SKIP,
+            first_config.option(ScrapingTarget.MOVIE, ScrapingMetadata.NFO).policy,
+        )
+        self.assertEqual(
+            ScrapingPolicy.MISSINGONLY,
+            second_config.option(ScrapingTarget.MOVIE, ScrapingMetadata.NFO).policy,
+        )
 
     def test_movie_dir_nfo_path(self):
         fileitem = schemas.FileItem(path="/movies/Avatar (2009)", name="Avatar (2009)", type="dir", storage="local")
@@ -64,6 +92,61 @@ class TestMediaScrapingPaths(unittest.TestCase):
         self.assertEqual(target_item, fileitem)
         self.assertEqual(target_path, Path("/tv/Show/Season 1/season.nfo"))
 
+    def test_season_dir_poster_path(self):
+        fileitem = schemas.FileItem(path="/tv/Show/Season 1", name="Season 1", type="dir", storage="local")
+        target_item, target_path = self.media_chain._get_target_fileitem_and_path(
+            current_fileitem=fileitem,
+            item_type=ScrapingTarget.SEASON,
+            metadata_type=ScrapingMetadata.POSTER,
+            filename_hint="season01-poster.jpg"
+        )
+        self.assertEqual(target_item, fileitem)
+        self.assertEqual(target_path, Path("/tv/Show/Season 1/poster.jpg"))
+
+    def test_season_dir_poster_paths_include_root_and_season_dir(self):
+        """季海报应同时写剧集根目录和季目录，兼容不同媒体库。"""
+        parent_item = schemas.FileItem(path="/tv/Show", name="Show", type="dir", storage="local")
+        fileitem = schemas.FileItem(path="/tv/Show/Season 1", name="Season 1", type="dir", storage="local")
+        targets = self.media_chain._get_target_fileitems_and_paths(
+            current_fileitem=fileitem,
+            item_type=ScrapingTarget.SEASON,
+            metadata_type=ScrapingMetadata.POSTER,
+            filename_hint="season01-poster.jpg",
+            parent_fileitem=parent_item,
+        )
+        self.assertEqual(
+            targets,
+            [
+                (parent_item, Path("/tv/Show/season01-poster.jpg")),
+                (fileitem, Path("/tv/Show/Season 1/poster.jpg")),
+            ],
+        )
+
+    def test_season_dir_specials_poster_path(self):
+        fileitem = schemas.FileItem(path="/tv/Show/Specials", name="Specials", type="dir", storage="local")
+        target_item, target_path = self.media_chain._get_target_fileitem_and_path(
+            current_fileitem=fileitem,
+            item_type=ScrapingTarget.SEASON,
+            metadata_type=ScrapingMetadata.POSTER,
+            filename_hint="season-specials-poster.jpg"
+        )
+        self.assertEqual(target_item, fileitem)
+        self.assertEqual(target_path, Path("/tv/Show/Specials/poster.jpg"))
+
+    def test_movie_file_image_path_uses_parent_dir(self):
+        """直接刮削电影文件时，图片应保存到父目录。"""
+        fileitem = schemas.FileItem(path="/movies/Avatar/Avatar.mkv", name="Avatar.mkv", type="file", storage="local")
+        parent_item = schemas.FileItem(path="/movies/Avatar", name="Avatar", type="dir", storage="local")
+        target_item, target_path = self.media_chain._get_target_fileitem_and_path(
+            current_fileitem=fileitem,
+            item_type=ScrapingTarget.MOVIE,
+            metadata_type=ScrapingMetadata.POSTER,
+            filename_hint="poster.jpg",
+            parent_fileitem=parent_item,
+        )
+        self.assertEqual(target_item, parent_item)
+        self.assertEqual(target_path, Path("/movies/Avatar/poster.jpg"))
+
     def test_episode_file_nfo_path(self):
         fileitem = schemas.FileItem(path="/tv/Show/Season 1/S01E01.mp4", name="S01E01.mp4", type="file", storage="local")
         parent_item = schemas.FileItem(path="/tv/Show/Season 1", name="Season 1", type="dir", storage="local")
@@ -79,6 +162,7 @@ class TestMediaScrapingPaths(unittest.TestCase):
 
 class TestMediaScrapingNFO(unittest.TestCase):
     def setUp(self):
+        reset_media_chain_singleton()
         self.media_chain = MediaChain()
         self.media_chain.storagechain = MagicMock()
         self.media_chain.metadata_nfo = MagicMock(return_value="<nfo></nfo>")
@@ -88,6 +172,9 @@ class TestMediaScrapingNFO(unittest.TestCase):
         self.fileitem = schemas.FileItem(path="/movies/Avatar (2009)", name="Avatar (2009)", type="dir", storage="local")
         self.meta = MetaInfo("Avatar (2009)")
         self.mediainfo = MediaInfo()
+
+    def tearDown(self):
+        reset_media_chain_singleton()
 
     def test_scrape_nfo_off(self):
         self.media_chain.scraping_policies.option.return_value = ScrapingOption("movie", "nfo", ScrapingPolicy.SKIP)
@@ -125,6 +212,7 @@ class TestMediaScrapingNFO(unittest.TestCase):
 
 class TestMediaScrapingImages(unittest.TestCase):
     def setUp(self):
+        reset_media_chain_singleton()
         self.media_chain = MediaChain()
         self.original_download = self.media_chain._download_and_save_image
         self.media_chain.storagechain = MagicMock()
@@ -134,6 +222,7 @@ class TestMediaScrapingImages(unittest.TestCase):
 
     def tearDown(self):
         self.media_chain._download_and_save_image = self.original_download
+        reset_media_chain_singleton()
 
     def test_scrape_images_mapping(self):
         fileitem = schemas.FileItem(path="/movies/Avatar", name="Avatar", type="dir", storage="local")
@@ -148,13 +237,16 @@ class TestMediaScrapingImages(unittest.TestCase):
 
         self.media_chain._scrape_images_generic(fileitem, mediainfo, ScrapingTarget.MOVIE)
 
-        # Check download called for mapped metadata
+        # Check download called for mapped metadata + aliases (fanart→backdrop)
         calls = self.media_chain._download_and_save_image.call_args_list
-        self.assertEqual(len(calls), 3)
         urls = [call.kwargs["url"] for call in calls]
+        paths = [call.kwargs["path"] for call in calls]
         self.assertIn("http://poster", urls)
         self.assertIn("http://fanart", urls)
         self.assertIn("http://logo", urls)
+        # fanart.jpg should also generate backdrop.jpg alias
+        self.assertIn(Path("/movies/Avatar/fanart.jpg"), paths)
+        self.assertIn(Path("/movies/Avatar/backdrop.jpg"), paths)
 
     def test_scrape_images_season_filter(self):
         fileitem = schemas.FileItem(path="/tv/Show/Season 1", name="Season 1", type="dir", storage="local")
@@ -169,8 +261,154 @@ class TestMediaScrapingImages(unittest.TestCase):
         self.media_chain._scrape_images_generic(fileitem, mediainfo, ScrapingTarget.SEASON, season_number=1)
 
         calls = self.media_chain._download_and_save_image.call_args_list
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0].kwargs["url"], "http://season01")
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(call.kwargs["url"] == "http://season01" for call in calls))
+        self.assertEqual(
+            [call.kwargs["path"] for call in calls],
+            [
+                Path("/tv/Show/season01-poster.jpg"),
+                Path("/tv/Show/Season 1/poster.jpg"),
+            ],
+        )
+
+    def test_scrape_movie_file_images_when_initialized_directly(self):
+        """直接初始化刮削电影文件时，应生成同级 poster/backdrop 及别名。"""
+        fileitem = schemas.FileItem(path="/movies/Avatar/Avatar.mkv", name="Avatar.mkv", type="file", storage="local")
+        parent_item = schemas.FileItem(path="/movies/Avatar", name="Avatar", type="dir", storage="local")
+        mediainfo = MediaInfo()
+        self.media_chain.metadata_img.return_value = {
+            "poster.jpg": "http://poster",
+            "backdrop.jpg": "http://backdrop",
+        }
+        self.media_chain.scraping_policies.option.return_value = ScrapingOption("movie", "poster", ScrapingPolicy.OVERWRITE)
+        self.media_chain.storagechain.get_file_item.return_value = None
+
+        self.media_chain._scrape_images_generic(
+            fileitem,
+            mediainfo,
+            ScrapingTarget.MOVIE,
+            parent_fileitem=parent_item,
+        )
+
+        paths = [call.kwargs["path"] for call in self.media_chain._download_and_save_image.call_args_list]
+        # poster has no alias, backdrop generates fanart alias
+        self.assertIn(Path("/movies/Avatar/poster.jpg"), paths)
+        self.assertIn(Path("/movies/Avatar/backdrop.jpg"), paths)
+        self.assertIn(Path("/movies/Avatar/fanart.jpg"), paths)
+
+    def test_scrape_episode_thumb_image_path(self):
+        fileitem = schemas.FileItem(path="/tv/Show/Season 1/S01E01.mp4", name="S01E01.mp4", type="file", storage="local")
+        parent_item = schemas.FileItem(path="/tv/Show/Season 1", name="Season 1", type="dir", storage="local")
+        mediainfo = MediaInfo()
+        self.media_chain.metadata_img.return_value = {
+            "thumb.jpg": "http://episode-thumb"
+        }
+        self.media_chain.scraping_policies.option.return_value = ScrapingOption("episode", "thumb", ScrapingPolicy.OVERWRITE)
+        self.media_chain.storagechain.get_file_item.return_value = None
+
+        self.media_chain._scrape_images_generic(
+            fileitem,
+            mediainfo,
+            ScrapingTarget.EPISODE,
+            parent_fileitem=parent_item,
+            season_number=1,
+            episode_number=1
+        )
+
+        self.media_chain.metadata_img.assert_called_once_with(
+            mediainfo=mediainfo,
+            season=1,
+            episode=1
+        )
+        self.media_chain._download_and_save_image.assert_called_once_with(
+            fileitem=parent_item,
+            path=Path("/tv/Show/Season 1/S01E01.jpg"),
+            url="http://episode-thumb"
+        )
+
+    def test_scrape_episode_thumb_image_path_via_parent_lookup(self):
+        fileitem = schemas.FileItem(path="/tv/Show/Season 1/S01E01.mp4", name="S01E01.mp4", type="file", storage="local")
+        parent_item = schemas.FileItem(path="/tv/Show/Season 1", name="Season 1", type="dir", storage="local")
+        mediainfo = MediaInfo()
+        self.media_chain.metadata_img.return_value = {
+            "thumb.jpg": "http://episode-thumb"
+        }
+        self.media_chain.scraping_policies.option.return_value = ScrapingOption("episode", "thumb", ScrapingPolicy.OVERWRITE)
+        self.media_chain.storagechain.get_parent_item.return_value = parent_item
+        self.media_chain.storagechain.get_file_item.return_value = None
+
+        self.media_chain._scrape_images_generic(
+            fileitem,
+            mediainfo,
+            ScrapingTarget.EPISODE,
+            season_number=1,
+            episode_number=1
+        )
+
+        self.media_chain.storagechain.get_parent_item.assert_called_once_with(fileitem)
+        self.media_chain._download_and_save_image.assert_called_once_with(
+            fileitem=parent_item,
+            path=Path("/tv/Show/Season 1/S01E01.jpg"),
+            url="http://episode-thumb"
+        )
+
+    def test_expand_with_aliases_backdrop(self):
+        """backdrop should also generate fanart alias."""
+        parent_item = schemas.FileItem(path="/movies/Avatar", name="Avatar", type="dir", storage="local")
+        targets = [(parent_item, Path("/movies/Avatar/backdrop.jpg"))]
+        self.media_chain.scraping_policies.option.return_value = ScrapingOption("movie", "backdrop", ScrapingPolicy.OVERWRITE)
+
+        expanded = self.media_chain._expand_with_aliases(targets, ScrapingTarget.MOVIE)
+        paths = [t[1] for t in expanded]
+        self.assertIn(Path("/movies/Avatar/backdrop.jpg"), paths)
+        self.assertIn(Path("/movies/Avatar/fanart.jpg"), paths)
+
+    def test_expand_with_aliases_thumb(self):
+        """thumb should also generate landscape alias."""
+        parent_item = schemas.FileItem(path="/tv/Show", name="Show", type="dir", storage="local")
+        targets = [(parent_item, Path("/tv/Show/thumb.jpg"))]
+        self.media_chain.scraping_policies.option.return_value = ScrapingOption("tv", "thumb", ScrapingPolicy.OVERWRITE)
+
+        expanded = self.media_chain._expand_with_aliases(targets, ScrapingTarget.TV)
+        paths = [t[1] for t in expanded]
+        self.assertIn(Path("/tv/Show/thumb.jpg"), paths)
+        self.assertIn(Path("/tv/Show/landscape.jpg"), paths)
+
+    def test_expand_with_aliases_skips_season_prefix(self):
+        """season-prefixed files should not get aliases."""
+        parent_item = schemas.FileItem(path="/tv/Show", name="Show", type="dir", storage="local")
+        targets = [(parent_item, Path("/tv/Show/season01-thumb.jpg"))]
+        self.media_chain.scraping_policies.option.return_value = ScrapingOption("season", "thumb", ScrapingPolicy.OVERWRITE)
+
+        expanded = self.media_chain._expand_with_aliases(targets, ScrapingTarget.SEASON)
+        self.assertEqual(len(expanded), 1)
+
+    def test_expand_with_aliases_respects_skip_policy(self):
+        """Alias should not be generated if its metadata type is set to SKIP."""
+        parent_item = schemas.FileItem(path="/movies/Avatar", name="Avatar", type="dir", storage="local")
+        targets = [(parent_item, Path("/movies/Avatar/backdrop.jpg"))]
+        # backdrop is OVERWRITE but fanart (also BACKDROP type) is SKIP
+        def option_side_effect(item_type, metadata_type):
+            if metadata_type == ScrapingMetadata.BACKDROP:
+                return ScrapingOption("movie", "backdrop", ScrapingPolicy.SKIP)
+            return ScrapingOption("movie", "backdrop", ScrapingPolicy.OVERWRITE)
+        self.media_chain.scraping_policies.option.side_effect = option_side_effect
+
+        expanded = self.media_chain._expand_with_aliases(targets, ScrapingTarget.MOVIE)
+        # fanart maps to BACKDROP which is SKIP, so no alias
+        self.assertEqual(len(expanded), 1)
+
+    def test_season_backdrop_path(self):
+        """Season backdrop should be saved in season directory."""
+        fileitem = schemas.FileItem(path="/tv/Show/Season 1", name="Season 1", type="dir", storage="local")
+        target_item, target_path = self.media_chain._get_target_fileitem_and_path(
+            current_fileitem=fileitem,
+            item_type=ScrapingTarget.SEASON,
+            metadata_type=ScrapingMetadata.BACKDROP,
+            filename_hint="season01-backdrop.jpg"
+        )
+        self.assertEqual(target_item, fileitem)
+        self.assertEqual(target_path, Path("/tv/Show/Season 1/backdrop.jpg"))
 
     @patch("app.chain.media.RequestUtils")
     @patch("app.chain.media.NamedTemporaryFile")
@@ -205,6 +443,7 @@ class TestMediaScrapingImages(unittest.TestCase):
 
         mock_request_utils.assert_called_with(proxies=mock_settings.PROXY, ua=mock_settings.NORMAL_USER_AGENT)
         mock_instance.get_stream.assert_called_with(url=url)
+        mock_temp_file.assert_called_once_with(delete=False, suffix=".jpg")
         tmp_mock.write.assert_any_call(b"data1")
         tmp_mock.write.assert_any_call(b"data2")
         mock_chmod.assert_called()
@@ -213,28 +452,62 @@ class TestMediaScrapingImages(unittest.TestCase):
         self.assertEqual(call_args["fileitem"], fileitem)
         self.assertEqual(call_args["new_name"], "poster.jpg")
 
+    @patch("app.chain.media.NamedTemporaryFile")
+    @patch("app.chain.media.Path.chmod")
+    def test_save_file_uses_python310_compatible_tempfile(self, mock_chmod, mock_temp_file):
+        """保存刮削文件时不应使用 Python 3.12 才支持的 delete_on_close 参数。"""
+        self.media_chain = MediaChain()
+        self.media_chain.storagechain = MagicMock()
+        self.media_chain._cleanup_temp_file = MagicMock()
+
+        fileitem = schemas.FileItem(path="/movies/Avatar", name="Avatar", type="dir", storage="local")
+        target_path = Path("/movies/Avatar/movie.nfo")
+
+        tmp_mock = MagicMock()
+        tmp_mock.name = "/tmp/mockfile"
+        mock_temp_file.return_value.__enter__.return_value = tmp_mock
+        self.media_chain.storagechain.upload_file.return_value = fileitem
+
+        self.media_chain._save_file(fileitem, target_path, "<nfo></nfo>")
+
+        mock_temp_file.assert_called_once_with(delete=False, suffix=".nfo")
+        tmp_mock.write.assert_called_once_with(b"<nfo></nfo>")
+        mock_chmod.assert_called()
+        self.media_chain.storagechain.upload_file.assert_called_once()
+        self.media_chain._cleanup_temp_file.assert_called_once_with(Path("/tmp/mockfile"))
+
 
 class TestMediaScrapingTVDirectory(unittest.TestCase):
     def setUp(self):
+        reset_media_chain_singleton()
         self.media_chain = MediaChain()
         self.media_chain.storagechain = MagicMock()
         self.media_chain._scrape_nfo_generic = MagicMock()
         self.media_chain._scrape_images_generic = MagicMock()
 
+    def tearDown(self):
+        reset_media_chain_singleton()
+
     @patch("app.chain.media.settings")
     def test_initialize_tv_directory_specials(self, mock_settings):
         # mock specials directory recognition
         mock_settings.RENAME_FORMAT_S0_NAMES = ["Specials", "SPs"]
-        mock_settings.RMT_MEDIAEXT = [".mp4", ".mkv"]
 
         fileitem = schemas.FileItem(path="/tv/Show/Specials", name="Specials", type="dir", storage="local")
         meta = MetaInfo("Show")
         mediainfo = MediaInfo(type=MediaType.TV)
-        self.media_chain.storagechain.list_files.return_value = []
+        filepath = Path(fileitem.path)
 
-        self.media_chain._handle_tv_scraping(fileitem, meta, mediainfo, init_folder=True, parent=None, overwrite=False, recursive=True)
+        self.media_chain._initialize_tv_directory_metadata(
+            fileitem=fileitem,
+            filepath=filepath,
+            meta=meta,
+            mediainfo=mediainfo,
+            parent=None,
+            overwrite=False,
+        )
 
-        self.media_chain._scrape_nfo_generic.assert_called_with(
+        self.media_chain._scrape_nfo_generic.assert_called_once_with(
             current_fileitem=fileitem,
             meta=meta,
             mediainfo=mediainfo,
@@ -242,7 +515,7 @@ class TestMediaScrapingTVDirectory(unittest.TestCase):
             overwrite=False,
             season_number=0
         )
-        self.media_chain._scrape_images_generic.assert_called_with(
+        self.media_chain._scrape_images_generic.assert_called_once_with(
             current_fileitem=fileitem,
             mediainfo=mediainfo,
             item_type=ScrapingTarget.SEASON,
@@ -251,15 +524,25 @@ class TestMediaScrapingTVDirectory(unittest.TestCase):
             season_number=0
         )
 
-    def test_initialize_tv_directory_season(self):
+    @patch("app.chain.media.settings")
+    def test_initialize_tv_directory_season(self, mock_settings):
+        mock_settings.RENAME_FORMAT_S0_NAMES = ["Specials", "SPs"]
+
         fileitem = schemas.FileItem(path="/tv/Show/Season 1", name="Season 1", type="dir", storage="local")
         meta = MetaInfo("Show")
         mediainfo = MediaInfo(type=MediaType.TV)
-        self.media_chain.storagechain.list_files.return_value = []
+        filepath = Path(fileitem.path)
 
-        self.media_chain._handle_tv_scraping(fileitem, meta, mediainfo, init_folder=True, parent=None, overwrite=False, recursive=True)
+        self.media_chain._initialize_tv_directory_metadata(
+            fileitem=fileitem,
+            filepath=filepath,
+            meta=meta,
+            mediainfo=mediainfo,
+            parent=None,
+            overwrite=False,
+        )
 
-        self.media_chain._scrape_nfo_generic.assert_called_with(
+        self.media_chain._scrape_nfo_generic.assert_called_once_with(
             current_fileitem=fileitem,
             meta=meta,
             mediainfo=mediainfo,
@@ -271,19 +554,22 @@ class TestMediaScrapingTVDirectory(unittest.TestCase):
 
 class TestMediaScrapeEvents(unittest.TestCase):
     def setUp(self):
+        reset_media_chain_singleton()
         self.media_chain = MediaChain()
+        self.media_chain.storagechain = MagicMock()
+
+    def tearDown(self):
+        reset_media_chain_singleton()
 
     @patch("app.chain.media.MediaChain.scrape_metadata")
-    @patch("app.chain.media.StorageChain.get_item")
-    @patch("app.chain.media.StorageChain.get_parent_item")
     def test_scrape_metadata_event_file(
-        self, mock_get_parent, mock_get_item, mock_scrape_metadata
+        self, mock_scrape_metadata
     ):
         fileitem = schemas.FileItem(path="/movies/movie.mkv", name="movie.mkv", type="file", storage="local")
         parent_item = schemas.FileItem(path="/movies", name="movies", type="dir", storage="local")
 
-        mock_get_item.return_value = fileitem
-        mock_get_parent.return_value = parent_item
+        self.media_chain.storagechain.get_item.return_value = fileitem
+        self.media_chain.storagechain.get_parent_item.return_value = parent_item
 
         mediainfo = MediaInfo()
         event = Event(
@@ -300,21 +586,19 @@ class TestMediaScrapeEvents(unittest.TestCase):
         mock_scrape_metadata.assert_called_once_with(
             fileitem=fileitem,
             mediainfo=mediainfo,
-            init_folder=False,
+            init_folder=True,
             parent=parent_item,
             overwrite=True
         )
 
     @patch("app.chain.media.MediaChain.scrape_metadata")
-    @patch("app.chain.media.StorageChain.get_item")
-    @patch("app.chain.media.StorageChain.is_bluray_folder")
     def test_scrape_metadata_event_dir_bluray(
-        self, mock_is_bluray, mock_get_item, mock_scrape_metadata
+        self, mock_scrape_metadata
     ):
         fileitem = schemas.FileItem(path="/movies/bluray_movie", name="bluray_movie", type="dir", storage="local")
 
-        mock_get_item.return_value = fileitem
-        mock_is_bluray.return_value = True
+        self.media_chain.storagechain.get_item.return_value = fileitem
+        self.media_chain.storagechain.is_bluray_folder.return_value = True
 
         mediainfo = MediaInfo()
         event = Event(
@@ -338,22 +622,19 @@ class TestMediaScrapeEvents(unittest.TestCase):
         )
 
     @patch("app.chain.media.MediaChain.scrape_metadata")
-    @patch("app.chain.media.StorageChain.get_item")
-    @patch("app.chain.media.StorageChain.is_bluray_folder")
-    @patch("app.chain.media.StorageChain.get_file_item")
     def test_scrape_metadata_event_dir_with_filelist(
-        self, mock_get_file_item, mock_is_bluray, mock_get_item, mock_scrape_metadata
+        self, mock_scrape_metadata
     ):
         fileitem = schemas.FileItem(path="/tv/show", name="show", type="dir", storage="local")
 
-        mock_get_item.return_value = fileitem
-        mock_is_bluray.return_value = False
+        self.media_chain.storagechain.get_item.return_value = fileitem
+        self.media_chain.storagechain.is_bluray_folder.return_value = False
 
         def side_effect_get_file_item(storage, path):
             path_str = str(path)
             return schemas.FileItem(path=path_str, name=Path(path_str).name, type="dir" if "." not in path_str else "file", storage="local")
 
-        mock_get_file_item.side_effect = side_effect_get_file_item
+        self.media_chain.storagechain.get_file_item.side_effect = side_effect_get_file_item
 
         mediainfo = MediaInfo()
         event = Event(
@@ -377,13 +658,12 @@ class TestMediaScrapeEvents(unittest.TestCase):
         self.assertIn("/tv/show/Season 1/S01E01.mp4", paths)
 
     @patch("app.chain.media.MediaChain.scrape_metadata")
-    @patch("app.chain.media.StorageChain.get_item")
     def test_scrape_metadata_event_dir_full(
-        self, mock_get_item, mock_scrape_metadata
+        self, mock_scrape_metadata
     ):
         fileitem = schemas.FileItem(path="/movies/movie", name="movie", type="dir", storage="local")
 
-        mock_get_item.return_value = fileitem
+        self.media_chain.storagechain.get_item.return_value = fileitem
 
         mediainfo = MediaInfo()
         meta = MetaInfo("movie")
@@ -501,22 +781,19 @@ class TestMediaScrapeEvents(unittest.TestCase):
         mock_handle_tv.assert_not_called()
 
     @patch("app.chain.media.MediaChain.scrape_metadata")
-    @patch("app.chain.media.StorageChain.get_item")
-    @patch("app.chain.media.StorageChain.is_bluray_folder")
-    @patch("app.chain.media.StorageChain.get_file_item")
     def test_scrape_metadata_event_dir_with_multiple_files(
-        self, mock_get_file_item, mock_is_bluray, mock_get_item, mock_scrape_metadata
+        self, mock_scrape_metadata
     ):
         fileitem = schemas.FileItem(path="/movies/collection", name="collection", type="dir", storage="local")
 
-        mock_get_item.return_value = fileitem
-        mock_is_bluray.return_value = False
+        self.media_chain.storagechain.get_item.return_value = fileitem
+        self.media_chain.storagechain.is_bluray_folder.return_value = False
 
         def side_effect_get_file_item(storage, path):
             path_str = str(path)
             return schemas.FileItem(path=path_str, name=Path(path_str).name, type="dir" if "." not in path_str else "file", storage="local")
 
-        mock_get_file_item.side_effect = side_effect_get_file_item
+        self.media_chain.storagechain.get_file_item.side_effect = side_effect_get_file_item
 
         mediainfo = MediaInfo()
         event = Event(
@@ -546,22 +823,19 @@ class TestMediaScrapeEvents(unittest.TestCase):
         self.assertIn("/movies/collection/movie3.avi", paths)
 
     @patch("app.chain.media.MediaChain.scrape_metadata")
-    @patch("app.chain.media.StorageChain.get_item")
-    @patch("app.chain.media.StorageChain.is_bluray_folder")
-    @patch("app.chain.media.StorageChain.get_file_item")
     def test_scrape_metadata_event_dir_with_tv_multi_seasons_episodes(
-        self, mock_get_file_item, mock_is_bluray, mock_get_item, mock_scrape_metadata
+        self, mock_scrape_metadata
     ):
         fileitem = schemas.FileItem(path="/tv/MultiSeasonShow", name="MultiSeasonShow", type="dir", storage="local")
 
-        mock_get_item.return_value = fileitem
-        mock_is_bluray.return_value = False
+        self.media_chain.storagechain.get_item.return_value = fileitem
+        self.media_chain.storagechain.is_bluray_folder.return_value = False
 
         def side_effect_get_file_item(storage, path):
             path_str = str(path)
             return schemas.FileItem(path=path_str, name=Path(path_str).name, type="dir" if "." not in path_str else "file", storage="local")
 
-        mock_get_file_item.side_effect = side_effect_get_file_item
+        self.media_chain.storagechain.get_file_item.side_effect = side_effect_get_file_item
 
         mediainfo = MediaInfo()
         event = Event(
@@ -609,6 +883,3 @@ class TestMediaScrapeEvents(unittest.TestCase):
                 fileitem=fileitem
             )
             mock_logger.assert_called_with(f"{Path(fileitem.path)} 无法识别文件媒体信息！")
-
-if __name__ == "__main__":
-    unittest.main()

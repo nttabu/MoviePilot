@@ -6,7 +6,7 @@ import unittest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from app.utils.ugreen_crypto import UgreenCrypto
+from app.modules.ugreen.crypto import UgreenCrypto
 
 
 def _generate_rsa_keys() -> tuple[str, rsa.RSAPrivateKey]:
@@ -89,7 +89,3 @@ class UgreenCryptoTest(unittest.TestCase):
         }
         decoded = self.crypto.decrypt_response(resp, req.aes_key)
         self.assertEqual(decoded, server_payload)
-
-
-if __name__ == "__main__":
-    unittest.main()

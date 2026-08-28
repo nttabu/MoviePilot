@@ -13,6 +13,7 @@ from app.core.config import settings, global_vars
 from app.log import logger
 from app.modules.filemanager import StorageBase
 from app.modules.filemanager.storages import transfer_process
+from app.schemas.exception import StorageQueryError
 from app.schemas.types import StorageSchema
 from app.utils.http import RequestUtils
 from app.utils.singleton import WeakSingleton
@@ -378,9 +379,10 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
             if not resp:
                 break
             next_marker = resp.get("next_marker")
-            for item in resp.get("items", []):
+            current_items = resp.get("items") or []
+            for item in current_items:
                 items.append(self.__get_fileitem(item, parent=str(fileitem.path)))
-            if len(resp.get("items")) < 100:
+            if len(current_items) < 100:
                 break
         return items
 
@@ -740,7 +742,9 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
             logger.error(f"【阿里云盘】下载链接为空: {fileitem.name}")
             return None
 
-        local_path = (path or settings.TEMP_PATH) / fileitem.name
+        local_path = self._build_download_path(fileitem, path or settings.TEMP_PATH)
+        if not local_path:
+            return None
 
         # 获取文件大小
         file_size = fileitem.size
@@ -831,29 +835,52 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
             return False
         return True
 
+    def __get_by_path_item(self, path: Path, drive_id: str = None) -> Optional[schemas.FileItem]:
+        """
+        按路径查询文件/目录项，无法确认状态时抛出 StorageQueryError。
+        NotFound 系列错误码表示确认不存在，其余错误（网络失败、限流、
+        权限或未知业务错误）均无法确认目标状态。
+        """
+        resp = self._request_api(
+            "POST",
+            "/adrive/v1.0/openFile/get_by_path",
+            json={
+                "drive_id": drive_id or self._default_drive_id,
+                "file_path": path.as_posix(),
+            },
+            no_error_log=True,
+        )
+        if resp is None:
+            raise StorageQueryError(f"【阿里云盘】无法确认文件状态（请求失败）: {path}")
+        code = resp.get("code")
+        if code:
+            if "NotFound" in str(code):
+                # 明确的不存在错误码，确认目标不存在
+                return None
+            raise StorageQueryError(
+                f"【阿里云盘】查询文件信息出错: {path} - {code} {resp.get('message')}")
+        return self.__get_fileitem(resp, parent=str(path.parent))
+
     def get_item(self, path: Path, drive_id: str = None) -> Optional[schemas.FileItem]:
         """
         获取指定路径的文件/目录项
         """
         try:
-            resp = self._request_api(
-                "POST",
-                "/adrive/v1.0/openFile/get_by_path",
-                json={
-                    "drive_id": drive_id or self._default_drive_id,
-                    "file_path": path.as_posix(),
-                },
-                no_error_log=True,
-            )
-            if not resp:
-                return None
-            if resp.get("code"):
-                logger.debug(f"【阿里云盘】获取文件信息失败: {resp.get('message')}")
-                return None
-            return self.__get_fileitem(resp, parent=str(path.parent))
+            return self.__get_by_path_item(path, drive_id=drive_id)
         except Exception as e:
             logger.debug(f"【阿里云盘】获取文件信息失败: {str(e)}")
             return None
+
+    def get_item_strict(self, path: Path) -> Optional[schemas.FileItem]:
+        """
+        获取指定路径的文件/目录项，无法确认状态时抛出 StorageQueryError。
+        """
+        try:
+            return self.__get_by_path_item(path)
+        except StorageQueryError:
+            raise
+        except Exception as e:
+            raise StorageQueryError(f"【阿里云盘】查询文件信息失败: {path} - {e}") from e
 
     def get_folder(self, path: Path) -> Optional[schemas.FileItem]:
         """

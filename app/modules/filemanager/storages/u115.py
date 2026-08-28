@@ -17,6 +17,7 @@ from app.core.config import settings, global_vars
 from app.log import logger
 from app.modules.filemanager import StorageBase
 from app.modules.filemanager.storages import transfer_process
+from app.schemas.exception import StorageQueryError
 from app.schemas.types import StorageSchema
 from app.utils.singleton import WeakSingleton
 from app.utils.string import StringUtils
@@ -24,6 +25,22 @@ from app.utils.limit import QpsRateLimiter, RateStats
 
 
 lock = Lock()
+
+
+MIN_U115_UPLOAD_PART_SIZE = 1 * 1024 * 1024
+U115_UPLOAD_PART_COUNT_TARGET = 96
+U115_DEFAULT_ACCEPTED_CODES = (0, 20004)
+U115_GET_INFO_ACCEPTED_CODES = (*U115_DEFAULT_ACCEPTED_CODES, 430004)
+U115_UPLOAD_PART_SIZE_STEPS = (
+    10 * 1024 * 1024,
+    16 * 1024 * 1024,
+    32 * 1024 * 1024,
+    64 * 1024 * 1024,
+    128 * 1024 * 1024,
+    256 * 1024 * 1024,
+    512 * 1024 * 1024,
+    1024 * 1024 * 1024,
+)
 
 
 class NoCheckInException(Exception):
@@ -283,10 +300,18 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
         return result.get("data")
 
     def _request_api(
-        self, method: str, endpoint: str, result_key: Optional[str] = None, **kwargs
+        self,
+        method: str,
+        endpoint: str,
+        result_key: Optional[str] = None,
+        *,
+        accepted_codes: Tuple[int, ...] = U115_DEFAULT_ACCEPTED_CODES,
+        **kwargs,
     ) -> Optional[Union[dict, list]]:
         """
         带错误处理和速率限制的API请求
+
+        :param accepted_codes: 当前接口可确认处理的业务码
         """
         # 检查会话
         self._check_session()
@@ -343,7 +368,13 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             time.sleep(self.limit_sleep_seconds)
             kwargs["retry_limit"] = retry_times - 1
             kwargs["no_error_log"] = no_error_log
-            return self._request_api(method, endpoint, result_key, **kwargs)
+            return self._request_api(
+                method,
+                endpoint,
+                result_key,
+                accepted_codes=accepted_codes,
+                **kwargs,
+            )
 
         # 处理请求错误
         try:
@@ -361,11 +392,17 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
                 f"【115】{method} 请求 {endpoint} 错误 {e}，等待 {sleep_duration} 秒后重试..."
             )
             time.sleep(sleep_duration)
-            return self._request_api(method, endpoint, result_key, **kwargs)
+            return self._request_api(
+                method,
+                endpoint,
+                result_key,
+                accepted_codes=accepted_codes,
+                **kwargs,
+            )
 
         # 返回数据
         ret_data = resp.json()
-        if ret_data.get("code") not in (0, 20004):
+        if ret_data.get("code") not in accepted_codes:
             error_msg = ret_data.get("message", "")
             if not no_error_log:
                 logger.warn(f"【115】{method} 请求 {endpoint} 出错：{error_msg}")
@@ -387,7 +424,13 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
                 time.sleep(self.limit_sleep_seconds)
                 kwargs["retry_limit"] = retry_times - 1
                 kwargs["no_error_log"] = no_error_log
-                return self._request_api(method, endpoint, result_key, **kwargs)
+                return self._request_api(
+                    method,
+                    endpoint,
+                    result_key,
+                    accepted_codes=accepted_codes,
+                    **kwargs,
+                )
             return None
 
         if result_key:
@@ -409,6 +452,24 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
                 while chunk := f.read(8192):
                     sha1.update(chunk)
         return sha1.finalize().hex()
+
+    @staticmethod
+    def __get_upload_part_size(file_size: int) -> int:
+        """
+        根据文件大小获取 115 OSS 上传分片大小。
+        """
+        if file_size <= 0:
+            return U115_UPLOAD_PART_SIZE_STEPS[0]
+
+        target_part_size = max(
+            MIN_U115_UPLOAD_PART_SIZE,
+            (file_size + U115_UPLOAD_PART_COUNT_TARGET - 1)
+            // U115_UPLOAD_PART_COUNT_TARGET,
+        )
+        for part_size in U115_UPLOAD_PART_SIZE_STEPS:
+            if target_part_size <= part_size:
+                return part_size
+        return U115_UPLOAD_PART_SIZE_STEPS[-1]
 
     def init_storage(self):
         pass
@@ -524,6 +585,9 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
         """
 
         def encode_callback(cb: str) -> str:
+            """
+            编码 115 OSS 回调参数。
+            """
             return oss2.utils.b64encode_as_string(cb)
 
         target_name = new_name or local_path.name
@@ -631,7 +695,10 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
                         else None,
                         modify_time=info_resp["utime"],
                     )
-            return self.get_item(target_path)
+            uploaded_item = self.get_item(target_path)
+            return uploaded_item or self.__build_uploaded_fileitem(
+                target_path, local_path, file_size
+            )
 
         # Step 4: 获取上传凭证
         token_resp = self._request_api("GET", "/open/upload/get_token", "data")
@@ -669,8 +736,9 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             security_token=SecurityToken,
         )
         bucket = oss2.Bucket(auth, endpoint, bucket_name)  # noqa
-        # determine_part_size方法用于确定分片大小，设置分片大小为 10M
-        part_size = determine_part_size(file_size, preferred_size=10 * 1024 * 1024)
+        part_size = determine_part_size(
+            file_size, preferred_size=self.__get_upload_part_size(file_size)
+        )
 
         # 初始化进度条
         logger.info(
@@ -723,14 +791,19 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             result = bucket.complete_multipart_upload(
                 object_name, upload_id, parts, headers=headers
             )
-            if result.status == 200:
-                logger.debug(
-                    f"【115】上传 Step 6 回调结果：{result.resp.response.json()}"
-                )
-                logger.info(f"【115】{target_name} 上传成功")
-            else:
+            if result.status != 200:
                 logger.warn(f"【115】{target_name} 上传失败，错误码: {result.status}")
                 return None
+            try:
+                callback_result = result.resp.response.json()
+            except Exception as e:
+                logger.error(f"【115】{target_name} 上传完成回调解析失败: {str(e)}")
+                return None
+            logger.debug(f"【115】上传 Step 6 回调结果：{callback_result}")
+            if not callback_result or not callback_result.get("state"):
+                logger.warn(f"【115】{target_name} 上传完成回调失败: {callback_result}")
+                return None
+            logger.info(f"【115】{target_name} 上传成功")
         except oss2.exceptions.OssError as e:
             if e.code == "FileAlreadyExists":
                 logger.warn(f"【115】{target_name} 已存在")
@@ -740,7 +813,30 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
                 )
                 return None
         # 返回结果
-        return self.get_item(target_path)
+        uploaded_item = self.get_item(target_path)
+        if uploaded_item:
+            return uploaded_item
+        logger.warn(
+            f"【115】{target_name} 上传已完成但元数据暂不可见，使用目标路径构造整理结果"
+        )
+        return self.__build_uploaded_fileitem(target_path, local_path, file_size)
+
+    def __build_uploaded_fileitem(
+        self, target_path: Path, local_path: Path, file_size: int
+    ) -> schemas.FileItem:
+        """
+        构造已上传文件项，用于兼容 115 上传成功后目录索引延迟刷新。
+        """
+        return schemas.FileItem(
+            storage=self.schema.value,
+            path=target_path.as_posix(),
+            type="file",
+            name=target_path.name,
+            basename=target_path.stem,
+            extension=target_path.suffix[1:] or None,
+            size=file_size,
+            modify_time=local_path.stat().st_mtime if local_path.exists() else None,
+        )
 
     def download(self, fileitem: schemas.FileItem, path: Path = None) -> Optional[Path]:
         """
@@ -763,7 +859,9 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             logger.error(f"【115】下载链接为空: {fileitem.name}")
             return None
 
-        local_path = (path or settings.TEMP_PATH) / fileitem.name
+        local_path = self._build_download_path(fileitem, path or settings.TEMP_PATH)
+        if not local_path:
+            return None
 
         # 获取文件大小
         file_size = detail.size
@@ -837,37 +935,61 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             return True
         return False
 
+    def __get_info_item(self, path: Path) -> Optional[schemas.FileItem]:
+        """
+        查询指定路径的文件/目录项，无法确认状态时抛出 StorageQueryError。
+        接口业务码 20004（记录不存在）、430004（路径不存在）与 0 一样
+        视为确认结果，其余错误（网络失败、限流重试用尽、未知业务错误）
+        均无法确认目标状态。
+        """
+        resp = self._request_api(
+            "POST",
+            "/open/folder/get_info",
+            data={"path": path.as_posix()},
+            no_error_log=True,
+            accepted_codes=U115_GET_INFO_ACCEPTED_CODES,
+        )
+        if resp is None:
+            raise StorageQueryError(f"【115】无法确认文件状态（请求失败或接口错误）: {path}")
+        data = resp.get("data") if isinstance(resp, dict) else None
+        if not data or not data.get("file_id"):
+            # 115 对记录不存在和路径不存在返回不同业务码，两者都可确认目标不存在
+            return None
+        return schemas.FileItem(
+            storage=self.schema.value,
+            fileid=str(data["file_id"]),
+            path=path.as_posix() + ("/" if data["file_category"] == "0" else ""),
+            type="file" if data["file_category"] == "1" else "dir",
+            name=data["file_name"],
+            basename=Path(data["file_name"]).stem,
+            extension=Path(data["file_name"]).suffix[1:]
+            if data["file_category"] == "1"
+            else None,
+            pickcode=data["pick_code"],
+            size=data["size_byte"] if data["file_category"] == "1" else None,
+            modify_time=data["utime"],
+        )
+
     def get_item(self, path: Path) -> Optional[schemas.FileItem]:
         """
         获取指定路径的文件/目录项
         """
         try:
-            resp = self._request_api(
-                "POST",
-                "/open/folder/get_info",
-                "data",
-                data={"path": path.as_posix()},
-                no_error_log=True,
-            )
-            if not resp:
-                return None
-            return schemas.FileItem(
-                storage=self.schema.value,
-                fileid=str(resp["file_id"]),
-                path=path.as_posix() + ("/" if resp["file_category"] == "0" else ""),
-                type="file" if resp["file_category"] == "1" else "dir",
-                name=resp["file_name"],
-                basename=Path(resp["file_name"]).stem,
-                extension=Path(resp["file_name"]).suffix[1:]
-                if resp["file_category"] == "1"
-                else None,
-                pickcode=resp["pick_code"],
-                size=resp["size_byte"] if resp["file_category"] == "1" else None,
-                modify_time=resp["utime"],
-            )
+            return self.__get_info_item(path)
         except Exception as e:
             logger.debug(f"【115】获取文件信息失败: {str(e)}")
             return None
+
+    def get_item_strict(self, path: Path) -> Optional[schemas.FileItem]:
+        """
+        获取指定路径的文件/目录项，无法确认状态时抛出 StorageQueryError。
+        """
+        try:
+            return self.__get_info_item(path)
+        except StorageQueryError:
+            raise
+        except Exception as e:
+            raise StorageQueryError(f"【115】查询文件信息失败: {path} - {e}") from e
 
     def get_folder(self, path: Path) -> Optional[schemas.FileItem]:
         """

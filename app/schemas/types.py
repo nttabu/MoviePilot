@@ -43,6 +43,22 @@ class TorrentStatus(Enum):
     DOWNLOADING = "下载中"
 
 
+# 下载器任务查询状态
+class TorrentQueryStatus(Enum):
+    ALL = "all"
+    TRANSFER = "transfer"
+    DOWNLOADING = "downloading"
+    COMPLETED = "completed"
+    PAUSED = "paused"
+
+
+# 下载器任务归一状态
+class DownloadTaskState(Enum):
+    DOWNLOADING = "downloading"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+
+
 # 异步广播事件
 class EventType(Enum):
     # 插件需要重载
@@ -105,6 +121,8 @@ class EventType(Enum):
     MessageAction = "message.action"
     # 执行工作流
     WorkflowExecute = "workflow.execute"
+    # Agent Tokens 用量
+    AgentTokensUsage = "agent.tokens.usage"
 
 
 # EventType中文名称翻译字典
@@ -139,11 +157,14 @@ EVENT_TYPE_NAMES = {
     EventType.ConfigChanged: "配置项更新",
     EventType.MessageAction: "消息交互动作",
     EventType.WorkflowExecute: "执行工作流",
+    EventType.AgentTokensUsage: "Agent Tokens 用量",
 }
 
 
 # 同步链式事件
 class ChainEventType(Enum):
+    # 插件数据重置前
+    PluginDataReset = "plugin.data.reset"
     # 名称识别
     NameRecognize = "name.recognize"
     # 认证验证
@@ -154,8 +175,12 @@ class ChainEventType(Enum):
     CommandRegister = "command.register"
     # 整理重命名
     TransferRename = "transfer.rename"
+    # 整理重命名上下文构建
+    TransferRenameBuild = "transfer.rename.build"
     # 整理拦截
     TransferIntercept = "transfer.intercept"
+    # 整理覆盖检查
+    TransferOverwriteCheck = "transfer.overwrite.check"
     # 资源选择
     ResourceSelection = "resource.selection"
     # 资源下载
@@ -170,6 +195,12 @@ class ChainEventType(Enum):
     WorkflowExecution = "workflow.execution"
     # 存储操作选择
     StorageOperSelection = "storage.operation"
+    # Agent LLM 供应商选择
+    AgentLLMProvider = "agent.llm.provider"
+    # 订阅总集数刷新
+    SubscribeEpisodesRefresh = "subscribe.episodes.refresh"
+    # 订阅完成检查
+    SubscribeCompletionCheck = "subscribe.completion.check"
 
 
 # 系统配置Key字典
@@ -184,6 +215,8 @@ class SystemConfigKey(Enum):
     NotificationSwitchs = "NotificationSwitchs"
     # 目录配置
     Directories = "Directories"
+    # 挂载型本地盘是否删除空目录
+    MountedLocalDiskDeleteEmptyDirs = "MountedLocalDiskDeleteEmptyDirs"
     # 存储配置
     Storages = "Storages"
     # 搜索站点范围
@@ -196,6 +229,8 @@ class SystemConfigKey(Enum):
     Customization = "Customization"
     # 自定义识别词
     CustomIdentifiers = "CustomIdentifiers"
+    # 集数定位规则词表
+    EpisodeFormatRuleTable = "EpisodeFormatRuleTable"
     # 转移屏蔽词
     TransferExcludeWords = "TransferExcludeWords"
     # 种子优先级规则
@@ -232,8 +267,12 @@ class SystemConfigKey(Enum):
     NotificationSendTime = "NotificationSendTime"
     # AI智能体配置
     AIAgentConfig = "AIAgentConfig"
+    # AI智能体外部MCP服务器配置
+    AIAgentMcpServers = "AIAgentMcpServers"
     # 通知消息格式模板
     NotificationTemplates = "NotificationTemplates"
+    # 通知中心清理时间
+    NotificationClearBefore = "NotificationClearBefore"
     # 刮削开关设置
     ScrapingSwitchs = "ScrapingSwitchs"
     # 插件安装统计
@@ -242,6 +281,8 @@ class SystemConfigKey(Enum):
     SetupWizardState = "SetupWizardState"
     # 绿联影视登录会话缓存
     UgreenSessionCache = "UgreenSessionCache"
+    # 共享媒体识别成功次数
+    MediaRecognizeShareCount = "MediaRecognizeShareCount"
 
 
 # 处理进度Key字典
@@ -276,6 +317,8 @@ class NotificationType(Enum):
     Manual = "手动处理"
     # 插件消息
     Plugin = "插件"
+    # 智能体消息
+    Agent = "智能体"
     # 其它消息
     Other = "其它"
 
@@ -301,12 +344,15 @@ class MessageChannel(Enum):
     消息渠道
     """
     Wechat = "微信"
+    Feishu = "飞书"
+    WechatClawBot = "微信ClawBot"
     Telegram = "Telegram"
     Slack = "Slack"
     Discord = "Discord"
     SynologyChat = "SynologyChat"
     VoceChat = "VoceChat"
     Web = "Web"
+    WebAgent = "WebAgent"
     WebPush = "WebPush"
     QQ = "QQ"
 
@@ -327,6 +373,8 @@ class DownloaderType(Enum):
 class MediaServerType(Enum):
     # Emby
     Emby = "Emby"
+    # 极影视
+    ZSpace = "ZSpace"
     # Jellyfin
     Jellyfin = "Jellyfin"
     # Plex
@@ -347,6 +395,8 @@ class MediaRecognizeType(Enum):
     TVDB = "TheTvDb"
     # bangumi
     Bangumi = "Bangumi"
+    # AniList
+    AniList = "AniList"
 
 
 # 用户配置Key字典
@@ -363,6 +413,7 @@ class StorageSchema(Enum):
     U115 = "u115"
     Rclone = "rclone"
     Alist = "alist"
+    AlistGo = "alistgo"
     SMB = "smb"
 
 
@@ -436,3 +487,5 @@ class ScrapingMetadata(NameValueEnum):
     BANNER = "横幅图"
     THUMB = "缩略图"
     DISC = "光盘图"
+    CLEARART = "透明艺术图"
+    LANDSCAPE = "横版缩略图"

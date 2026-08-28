@@ -10,7 +10,9 @@ from app.utils.http import RequestUtils, AsyncRequestUtils
 
 class BangumiApi(object):
     """
-    https://bangumi.github.io/api/
+    Bangumi API客户端。
+
+    接口文档：https://bangumi.github.io/api/
     """
 
     _urls = {
@@ -28,8 +30,15 @@ class BangumiApi(object):
 
     def __init__(self):
         self._session = requests.Session()
-        self._req = RequestUtils(ua=settings.NORMAL_USER_AGENT, session=self._session)
-        self._async_req = AsyncRequestUtils(ua=settings.NORMAL_USER_AGENT)
+        self._req = RequestUtils(
+            ua=settings.NORMAL_USER_AGENT,
+            proxies=settings.PROXY,
+            session=self._session,
+        )
+        self._async_req = AsyncRequestUtils(
+            ua=settings.NORMAL_USER_AGENT,
+            proxies=settings.PROXY,
+        )
 
     @cached(maxsize=settings.CONF.bangumi, ttl=settings.CONF.meta, shared_key="get")
     def __invoke(self, url, key: Optional[str] = None, **kwargs):
@@ -39,7 +48,7 @@ class BangumiApi(object):
             params.update(kwargs)
         resp = self._req.get_res(url=req_url, params=params)
         try:
-            if not resp:
+            if resp is None or resp.status_code != 200:
                 return None
             result = resp.json()
             return result.get(key) if key else result
@@ -55,7 +64,7 @@ class BangumiApi(object):
             params.update(kwargs)
         resp = await self._async_req.get_res(url=req_url, params=params)
         try:
-            if not resp:
+            if resp is None or resp.status_code != 200:
                 return None
             result = resp.json()
             return result.get(key) if key else result
@@ -306,6 +315,9 @@ class BangumiApi(object):
         """
         self.__invoke.cache_clear()
 
-    def close(self):
+    def close(self) -> None:
+        """
+        关闭Bangumi会话
+        """
         if self._session:
             self._session.close()

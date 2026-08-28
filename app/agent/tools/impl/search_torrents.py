@@ -6,9 +6,10 @@ from typing import List, Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.search import SearchChain
 from app.db.systemconfig_oper import SystemConfigOper
-from app.helper.sites import SitesHelper
+from app.helper.sites import SitesHelper  # noqa
 from app.log import logger
 from app.schemas.types import MediaType, SystemConfigKey
 from ._torrent_search_utils import (
@@ -19,45 +20,66 @@ from ._torrent_search_utils import (
 
 class SearchTorrentsInput(BaseModel):
     """搜索种子工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
-    tmdb_id: Optional[int] = Field(None, description="TMDB ID (can be obtained from search_media tool). Either tmdb_id or douban_id must be provided.")
-    douban_id: Optional[str] = Field(None, description="Douban ID (can be obtained from search_media tool). Either tmdb_id or douban_id must be provided.")
+    tmdb_id: Optional[int] = Field(None, description="TMDB media ID")
+    douban_id: Optional[str] = Field(None, description="Douban media ID")
+    bangumi_id: Optional[int] = Field(None, description="Bangumi media ID")
+    anilist_id: Optional[int] = Field(None, description="AniList media ID")
+    media_source: Optional[str] = Field(None, description="Media metadata source")
+    media_id: Optional[str] = Field(None, description="Native ID for media_source")
     media_type: Optional[str] = Field(None, description="Allowed values: movie, tv")
     area: Optional[str] = Field(None, description="Search scope: 'title' (default) or 'imdbid'")
     sites: Optional[List[int]] = Field(None,
                                        description="Array of specific site IDs to search on (optional, if not provided searches all configured sites)")
 
+
 class SearchTorrentsTool(MoviePilotTool):
     name: str = "search_torrents"
-    description: str = ("Search for torrent files by media ID across configured indexer sites, cache the matched results, "
-                        "and return available filter options for follow-up selection. "
-                        "Requires tmdb_id or douban_id (can be obtained from search_media tool) for accurate matching.")
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Resource,
+        ToolTag.Site,
+        ToolTag.Media,
+    ]
+    description: str = (
+        "Search for torrent files by media ID across configured indexer sites, cache the matched results, "
+        "and return available filter options for follow-up selection. "
+        "Accepts a TMDB, Douban, Bangumi, AniList, or source-native media ID for accurate matching.")
     args_schema: Type[BaseModel] = SearchTorrentsInput
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
         """根据搜索参数生成友好的提示消息"""
-        tmdb_id = kwargs.get("tmdb_id")
-        douban_id = kwargs.get("douban_id")
         media_type = kwargs.get("media_type")
-
-        if tmdb_id:
-            message = f"正在搜索种子: TMDB={tmdb_id}"
-        elif douban_id:
-            message = f"正在搜索种子: 豆瓣={douban_id}"
-        else:
-            message = "正在搜索种子"
+        identities = (
+            ("TMDB", kwargs.get("tmdb_id")),
+            ("豆瓣", kwargs.get("douban_id")),
+            ("Bangumi", kwargs.get("bangumi_id")),
+            ("AniList", kwargs.get("anilist_id")),
+            (kwargs.get("media_source") or "媒体源", kwargs.get("media_id")),
+        )
+        label, identity = next(
+            ((label, identity) for label, identity in identities if identity is not None),
+            (None, None),
+        )
+        message = f"搜索种子: {label}={identity}" if label else "搜索种子"
         if media_type:
             message += f" [{media_type}]"
         return message
 
+    @staticmethod
+    def _load_configured_sites() -> List[int]:
+        """同步读取默认搜索站点列表。"""
+        return SystemConfigOper().get(SystemConfigKey.IndexerSites) or []
+
     async def run(self, tmdb_id: Optional[int] = None, douban_id: Optional[str] = None,
+                  bangumi_id: Optional[int] = None, anilist_id: Optional[int] = None,
+                  media_source: Optional[str] = None, media_id: Optional[str] = None,
                   media_type: Optional[str] = None, area: Optional[str] = None,
                   sites: Optional[List[int]] = None, **kwargs) -> str:
         logger.info(
             f"执行工具: {self.name}, 参数: tmdb_id={tmdb_id}, douban_id={douban_id}, media_type={media_type}, area={area}, sites={sites}")
 
-        if not tmdb_id and not douban_id:
-            return "参数错误：tmdb_id 和 douban_id 至少需要提供一个，请先使用 search_media 工具获取媒体 ID。"
+        if not any((tmdb_id, douban_id, bangumi_id, anilist_id, media_id)):
+            return "参数错误：至少需要提供一个媒体 ID，请先使用 search_media 工具获取媒体信息。"
 
         try:
             search_chain = SearchChain()
@@ -70,6 +92,10 @@ class SearchTorrentsTool(MoviePilotTool):
             filtered_torrents = await search_chain.async_search_by_id(
                 tmdbid=tmdb_id,
                 doubanid=douban_id,
+                bangumiid=bangumi_id,
+                anilistid=anilist_id,
+                source=media_source,
+                mediaid=media_id,
                 mtype=media_type_enum,
                 area=area or "title",
                 sites=sites,
@@ -83,8 +109,7 @@ class SearchTorrentsTool(MoviePilotTool):
             if sites:
                 search_site_ids = sites
             else:
-                configured_sites = SystemConfigOper().get(SystemConfigKey.IndexerSites)
-                search_site_ids = configured_sites if configured_sites else []
+                search_site_ids = self._load_configured_sites()
 
             if filtered_torrents:
                 await search_chain.async_save_cache(filtered_torrents, SEARCH_RESULT_CACHE_FILE)
@@ -97,9 +122,9 @@ class SearchTorrentsTool(MoviePilotTool):
                 }, ensure_ascii=False, indent=2)
                 return result_json
             else:
-                media_id = f"TMDB={tmdb_id}" if tmdb_id else f"豆瓣={douban_id}"
+                identity = media_id or tmdb_id or douban_id or bangumi_id or anilist_id
                 result_json = json.dumps({
-                    "message": f"未找到相关种子资源: {media_id}",
+                    "message": f"未找到相关种子资源: {identity}",
                     "all_sites": all_sites,
                     "search_site_ids": search_site_ids,
                 }, ensure_ascii=False, indent=2)

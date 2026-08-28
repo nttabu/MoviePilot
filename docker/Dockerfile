@@ -1,4 +1,4 @@
-FROM python:3.12.8-slim-bookworm AS base
+FROM python:3.12.13-slim-bookworm AS base
 
 
 # 准备软件包
@@ -24,15 +24,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     gosu \
     bash \
+    ca-certificates \
     curl \
     wget \
+    git \
+    gh \
     busybox \
-    dumb-init \
+    tini \
+    cron \
     jq \
+    ripgrep \
+    less \
+    unzip \
     fuse3 \
     rsync \
-    ffmpeg \
+    openssh-client \
+    sshpass \
+    iproute2 \
+    netcat-openbsd \
+    lsof \
     nano \
+    unar \
     libjemalloc2 \
     && dpkg-reconfigure --frontend noninteractive tzdata \
     && curl https://rclone.org/install.sh | bash \
@@ -66,10 +78,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 安装 Python 构建依赖并创建虚拟环境
 WORKDIR /app
 COPY requirements.in requirements.in
+COPY scripts/uv-pip-compat.sh /usr/local/bin/uv-pip-compat
 RUN python3 -m venv ${VENV_PATH} \
-    && pip install --upgrade "pip<25.0" \
-    && pip install "Cython" "pip-tools<7.5" \
-    && pip-compile requirements.in \
+    && env UV_INSTALL_DIR=/usr/local/bin sh -c "$(curl -LsSf https://astral.sh/uv/install.sh)" \
+    && chmod +x /usr/local/bin/uv-pip-compat \
+    && ln -sf /usr/local/bin/uv ${VENV_PATH}/bin/uv \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip3 \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip3.12 \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip-compile \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip-sync \
+    && pip-compile requirements.in -o requirements.txt \
     && pip install -r requirements.txt
 
 # 下载准备代码
@@ -85,20 +104,29 @@ RUN FRONTEND_VERSION=$(sed -n "s/^FRONTEND_VERSION\s*=\s*'\([^']*\)'/\1/p" /app/
     && mv -f /tmp/MoviePilot-Plugins-main/plugins.v2/* /app/app/plugins/ \
     && cat /tmp/MoviePilot-Plugins-main/package.json | jq -r 'to_entries[] | select(.value.v2 == true) | .key' | awk '{print tolower($0)}' | \
     while read -r i; do if [ ! -d "/app/app/plugins/$i" ]; then mv "/tmp/MoviePilot-Plugins-main/plugins/$i" "/app/app/plugins/"; else echo "跳过 $i"; fi; done \
-    && curl -sL "https://github.com/jxxghp/MoviePilot-Resources/archive/refs/heads/main.zip" | busybox unzip -d /tmp - \
-    && mv -f /tmp/MoviePilot-Resources-main/resources.v2/* /app/app/helper/
+    && curl -sL "https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/main/resources.v2/user.sites.v2.bin" -o /app/app/helper/user.sites.v2.bin \
+    && python_ver=$(python3 -c 'import sys; print(f"cpython-{sys.version_info.major}{sys.version_info.minor}")') \
+    && ARCH=$(uname -m) \
+    && if [ "$ARCH" = "aarch64" ]; then SUFFIX="aarch64-linux-gnu"; else SUFFIX="x86_64-linux-gnu"; fi \
+    && curl -sL "https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/main/resources.v2/sites.${python_ver}-${SUFFIX}.so" -o "/app/app/helper/sites.${python_ver}-${SUFFIX}.so"
 
 # final 阶段: 安装运行时依赖和配置最终镜像
 FROM prepare_package AS final
 
-ENV LD_PRELOAD="/usr/local/lib/libjemalloc.so"
+ENV LD_PRELOAD="/usr/local/lib/libjemalloc.so" \
+    MOVIEPILOT_DOCKER_KEEPALIVE_ON_FAILURE="true"
+
+# 引入支持 amr 编码的静态 ffmpeg
+COPY --from=mwader/static-ffmpeg:8.1.1 /ffmpeg /usr/local/bin/
+COPY --from=mwader/static-ffmpeg:8.1.1 /ffprobe /usr/local/bin/
 
 # python 环境
 COPY --from=prepare_venv --chmod=777 ${VENV_PATH} ${VENV_PATH}
+COPY --from=prepare_venv /usr/local/bin/uv /usr/local/bin/uv
+COPY --from=prepare_venv /usr/local/bin/uv-pip-compat /usr/local/bin/uv-pip-compat
 
-# playwright 环境
+# 浏览器运行依赖
 RUN playwright install-deps chromium \
-    && playwright install-deps firefox \
     && apt-get autoremove -y \
     && apt-get clean \
     && rm -rf \
@@ -117,7 +145,8 @@ RUN cp -f /app/docker/nginx.common.conf /etc/nginx/common.conf \
     && cp -f /app/docker/update.sh /usr/local/bin/mp_update.sh \
     && cp -f /app/docker/entrypoint.sh /entrypoint.sh \
     && cp -f /app/docker/docker_http_proxy.conf /etc/nginx/docker_http_proxy.conf \
-    && chmod +x /entrypoint.sh /usr/local/bin/mp_update.sh \
+    && printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'cd /app' 'exec "${VENV_PATH:-/opt/venv}/bin/python3" -m app.cli "$@"' > /usr/local/bin/moviepilot \
+    && chmod +x /entrypoint.sh /usr/local/bin/mp_update.sh /usr/local/bin/moviepilot \
     && mkdir -p ${HOME} \
     && groupadd -r moviepilot -g 918 \
     && useradd -r moviepilot -g moviepilot -d ${HOME} -s /bin/bash -u 918 \
@@ -130,4 +159,5 @@ RUN cp -f /app/docker/nginx.common.conf /etc/nginx/common.conf \
 
 EXPOSE 3000
 VOLUME [ "${CONFIG_DIR}" ]
-ENTRYPOINT [ "/entrypoint.sh" ]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 CMD curl -fsS "http://127.0.0.1:${PORT:-3001}/api/v1/system/global?token=moviepilot" >/dev/null || exit 1
+ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/entrypoint.sh" ]
